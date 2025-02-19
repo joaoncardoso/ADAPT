@@ -2,70 +2,13 @@
 This file implements the EPO algorithm. See the `epo` function for the main entrypoint.
 """
 import dataclasses
-import time
-import contextlib
-from typing import Callable, Dict, List, Union, Tuple
-
-import numpy as np
+from typing import List, Dict, Callable, Optional, Union, Tuple
+from sae_lens import HookedSAETransformer
 import torch
-import torch.distributions
 import torch.nn.functional as F
 import transformers
 
-
-def load_tokenizer():
-    """Load up a Pythia tokenizer. All the pythia models use the same
-    tokenizer."""
-    return transformers.AutoTokenizer.from_pretrained("EleutherAI/pythia-70m-deduped")
-
-
-def load_model(
-    model_size="12b", requires_grad=False, attn_implementation="flash_attention_2"
-):
-    """Load up a Pythia model ready for dreaming."""
-    model_name = f"EleutherAI/pythia-{model_size}-deduped"
-    model = transformers.GPTNeoXForCausalLM.from_pretrained(
-        model_name,
-        low_cpu_mem_usage=True,
-        torch_dtype=torch.float16,
-        use_cache=False,
-        device_map="cuda",
-        attn_implementation=attn_implementation,
-    )
-
-    if not requires_grad:
-        # If we're not optimizing any model parameters so mark the
-        # requires_grad(False). This will dramatically reduce memory
-        # requirements.
-        for name, param in model.named_parameters():
-            param.requires_grad_(False)
-
-    tokenizer = load_tokenizer()
-    return model, tokenizer
-
-
-@contextlib.contextmanager
-def add_fwd_hooks(module_hooks: List[Tuple[torch.nn.Module, Callable]]):
-    """
-    Context manager for temporarily adding forward hooks to a model.
-
-    Parameters
-    ----------
-    module_hooks
-        A list of pairs: (module, fnc) The function will be registered as a
-            forward hook on the module
-    """
-    try:
-        handles = []
-        for mod, hk in module_hooks:
-            handles.append(mod.register_forward_hook(hk))
-        yield
-    finally:
-        for h in handles:
-            h.remove()
-
-
-@dataclasses.dataclass
+@dataclasses.dataclass # TODO
 class History:
     """
     The `epo` function returns a History object that contains the full history
@@ -113,8 +56,8 @@ class History:
 @torch.no_grad()
 def epo(
     cache_run: Callable,
-    model: torch.nn.Module,
-    tokenizer: transformers.PreTrainedTokenizer,
+    model: torch.nn.Module, # becomes HookedSAETransformer
+    tokenizer: transformers.PreTrainedTokenizer, # use model.to_tokens()
     seq_len: int = 12,
     population_size: int = 8,
     iters: int = 300,
