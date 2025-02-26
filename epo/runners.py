@@ -12,8 +12,66 @@ from typing import Optional, Tuple
 import torch
 from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
 
-from dreamy.epo import add_fwd_hooks
-
+def sae_feature_runner(model, sae, feature_idx, use_post=False):
+    """
+    Create a runner function for optimizing prompts to maximize SAE feature activation.
+    
+    Args:
+        model: The HookedSAETransformer model
+        sae: The sparse autoencoder
+        feature_idx: Index of the feature to target
+        use_post: If True, use post-activation values, otherwise use pre-activation
+    
+    Returns:
+        callable: A function compatible with EPO that returns a dict with 'target' and 'logits'
+    """
+    def run(input_ids=None, attention_mask=None, inputs_embeds=None):
+        # Run model with the SAE and capture cache
+        outputs, cache = model.run_with_cache_with_saes(
+            input_ids=input_ids,
+            attention_mask=attention_mask,
+            inputs_embeds=inputs_embeds,
+            saes=[sae]
+        )
+        
+        # Get SAE activations - either pre or post activations
+        sae_acts_key = f"{sae.cfg.hook_name}.hook_sae_acts_{'post' if use_post else 'pre'}"
+        
+        if sae_acts_key not in cache:
+            # Try the alternative if the requested one isn't found
+            alt_key = f"{sae.cfg.hook_name}.hook_sae_acts_{'pre' if use_post else 'post'}"
+            if alt_key in cache:
+                sae_acts_key = alt_key
+                print(f"Warning: Requested key {sae_acts_key} not found, using {alt_key} instead")
+            else:
+                raise KeyError(f"Could not find SAE activations in cache. Available keys: {list(cache.keys())}")
+        
+        sae_acts = cache[sae_acts_key]
+        
+        # Get activations at the last non-padding token for each sequence
+        if attention_mask is not None:
+            # Calculate sequence lengths from attention mask
+            seq_lengths = attention_mask.sum(dim=1).to(torch.long)
+            batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
+            
+            # Initialize target values
+            target = torch.zeros(batch_size, device=model.device)
+            
+            # Extract feature activation at the last token of each sequence
+            for i in range(batch_size):
+                if seq_lengths[i] > 0:
+                    pos = seq_lengths[i] - 1  # 0-indexed
+                    target[i] = sae_acts[i, pos, feature_idx]
+        else:
+            # If no attention mask, use the last position
+            target = sae_acts[:, -1, feature_idx]
+        
+        return {
+            "target": target,
+            "logits": outputs.logits
+        }
+    
+    return run
 
 def does_retokenize(model, tokenizer, input_ids):
     good = torch.empty(input_ids.shape[0], dtype=bool).to(model.device)
