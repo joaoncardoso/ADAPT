@@ -87,15 +87,12 @@ class History:
 @torch.no_grad()
 def epo(
     cache_run: Callable,
-    model: HookedSAETransformer, # becomes HookedSAETransformer
-    #tokenizer: transformers.PreTrainedTokenizer, # use model.to_tokens()
-    #seq_len: int = 12,
+    model: HookedSAETransformer, 
     population_size: int = 8,
     iters: int = 300,
     explore_per_pop: int = 32,
     batch_size: int = 256,
     topk: int = 512,
-    #mutation_method: str = "gradient",
     x_penalty_min: float = 1.0 / 10.0,
     x_penalty_max: float = 10.0,
     ignore_fluency: bool = False,
@@ -111,85 +108,14 @@ def epo(
     p_sample_swap: float = 0,  # prob of an iteration being a sampled swap
     p_delete: float = 0,  # prob of an iteration being a delete
     history: History = None,
-    #catch_keyboard_interrupt: bool = False,
-    #callback: Union[Callable, bool] = None,
-    #always_recompute_gradients: bool = False,
+    callback: Union[Callable, bool] = None,
 ) -> History:
     """
-    Run the EPO algorithm. See the paper for details.
-
-    Parameters
-    ----------
-    cache_run
-        A callable that accepts either input_ids or inputs_embeds and returns a
-        dictionary containing the `target` and the logits for each token
-        position.
-    model
-    tokenizer
-    seq_len, optional
-        The number of tokens in the optimized prompt, by default 16
-    population_size, optional
-        The population to keep at each iteration, by default 32
-    iters, optional
-        Number of iterations to run EPO, by default 1000
-    explore_per_pop, optional
-        Number of children per population member per iteration, by default 4
-    batch_size, optional
-        GPU batch size, by default 8
-    topk, optional
-        When selecting token replacements, we select the `topk` tokens by
-        gradient magnitude and choose uniformly at random between those, by
-        default 32.
-    mutation_method, optional
-        research, ignore, by default "gradient"
-    x_penalty_min, optional
-        The minimum cross-entropy penalty, by default 1.0/16.0
-    x_penalty_max, optional
-        The maximum cross-entropy penalty, by default 16.0
-    restart_frequency, optional
-        How often do we reset the Pareto frontier, by default 50
-    restart_xentropy, optional
-        When we reset the Pareto frontier, we select a population member that
-        is optimal according to a cross-entropy penalty that is selected
-        uniformly at random in the domain
-        [restart_xentropy / restart_xentropy_max_mult,
-         restart_xentropy * restart_xentropy_max_mult],
-        restart_xentropy is by default 2.0
-    restart_xentropy_max_mult, optional
-        See the explanation for restart_xentropy, by default 3.0
-    seed, optional
-        Random seed used for initialization, by default 0
-    initial_ids, optional
-        The initial token ids to begin optimizing from. If None, the initial
-        token ids will be selected randomly, by default None
-    history, optional
-        The history of an EPO run that we want to continue, by default None
-    catch_keyboard_interrupt, optional
-        Should we catch keyboard interrupts and end the EPO loop?, by default False
-    callback, optional
-        A function called at the beginning of each iteration, by default None
-    always_recompute_gradients, optional
-        If a population member is retained across an iteration, we default to
-        not recomputing that population member's token gradients. If your
-        cache_run stores internal state that changes, you may want to override
-        this behavior and recompute gradients every iteration.
-
-    Returns
-    -------
-        A History object containing the full history of the
-
-    Raises
-    ------
-    ValueError
-        _description_
-    ValueError
-        _description_
-    ValueError
-        _description_
+    TODO: Add docstring
     """
     start = time.time()
     explore_size = population_size * explore_per_pop
-    device = model.device
+    device = model.W_E.device
 
     if seed is not None:
         torch.manual_seed(seed)
@@ -197,12 +123,10 @@ def epo(
     # pad token
     pad_token_id = model.tokenizer.pad_token_id
     if pad_token_id is None:
-        # Some models might not have pad_token_id set
-        # In this case we should set it
         pad_token_id = model.tokenizer.eos_token_id
 
     if ignore_fluency:
-        X = torch.zeros(population_size, device=model.device)
+        X = torch.zeros(population_size, device=model.W_E.device)
     else:
         X = torch.exp(torch.linspace(np.log(x_penalty_min), np.log(x_penalty_max), population_size)).to(device)
 
@@ -224,29 +148,28 @@ def epo(
         input_ids = history.ids[-1, history.keep[-1]]
     elif init_prompt is not None:
         history = History()
-        input_ids = (model.to_tokens(init_prompt)).to(model.device)
-        if not (min_tokens <= initial_ids.shape[1] <= max_tokens):
+        single_input_ids = model.to_tokens(init_prompt).to(model.W_E.device)
+        if not (min_tokens <= single_input_ids.shape[1] <= max_tokens):
             raise ValueError(f"initial_ids must have shape (*, n) where {min_tokens} <= n <= {max_tokens}")
+        input_ids = single_input_ids.repeat(population_size, 1)
     else:
         history = History()
         input_ids = torch.randint(
-            0, tokenizer.vocab_size, (population_size, int((min_tokens + max_tokens)/2)) # seq_len will be mid of min and max
-        ).to(model.device)
-
-    #selector = GradientSelector(model, cache_run, X, batch_size)
+            0, model.W_E.shape[0], (population_size, int((min_tokens + max_tokens)/2)) # seq_len will be mid of min and max
+        ).to(model.W_E.device)
 
     op_probs = torch.tensor([p_gcg_swap, p_sample_insert, p_sample_swap, p_delete])
 
     # Initial state evaluation
-    state = evaluate_fitness(model, cache_run, input_ids) # TODO
+    state = evaluate_fitness(model, cache_run, input_ids)
 
     #### Run the EPO loop: ####
     #if hasattr(cache_run, "setup"):
     #    cache_run.setup(input_ids)
     #state = selector.setup(input_ids)
 
-    # Do I want to re-add the try block here?
     for i in range(iters):
+
         ########################################
         # 1) Report!
         ########################################
@@ -256,12 +179,18 @@ def epo(
                 break
             start = time.time()
 
+        # select operations
+        operation_idx = torch.multinomial(op_probs, 1).item()
+        operation = ["gcg_swap", "sample_insert", "sample_swap", "delete"][operation_idx]
+
+        # compute gradients if needed
+        if operation == "gcg_swap":
+            state = compute_gradients(model, cache_run, state.input_ids, state.attention_mask, X)
+
         ########################################
         # 2) Birth children from parents
         # copy inputs to expand out to explore_size new candidates.
         ########################################
-        operation_idx = torch.multinomial(op_probs, 1).item()
-        operation = ["gcg_swap", "sample_insert", "sample_swap", "delete"][operation_idx]
 
         source_idx = torch.cat(
             (
@@ -271,11 +200,6 @@ def epo(
                 torch.arange(explore_size % state.ids.shape[0], device=device),
             )
         )
-        #Do I need these?
-        #assert source_idx.shape[0] == explore_size
-        #assert (source_idx < state.ids.shape[0]).all()
-
-        #new_ids = state.ids[source_idx, :].clone()
 
         ########################################
         # 3) Run the selector. This might be:
@@ -284,30 +208,29 @@ def epo(
         #    - Sample swap
         #    - Delete
         ########################################
-        #selector.mutate(state, source_idx, new_ids, topk)
 
         # Apply selected mutation operation
         if operation == "gcg_swap":
-            candidate_ids, candidate_masks = apply_gcg_swap(
-                model, cache_run, state, source_idx, topk, explore_size
+            candidate_ids, candidate_masks, mutation_positions  = apply_gcg_swap(
+                state, source_idx, topk, explore_size
             )
         elif operation == "sample_insert":
-            candidate_ids, candidate_masks = apply_sample_insert(
+            candidate_ids, candidate_masks, mutation_positions = apply_sample_insert(
                 model, state, source_idx, explore_size
             )
         elif operation == "sample_swap":
-            candidate_ids, candidate_masks = apply_sample_swap(
+            candidate_ids, candidate_masks, mutation_positions = apply_sample_swap(
                 model, state, source_idx, explore_size
             )
         else:  # delete
-            candidate_ids, candidate_masks = apply_delete(
+            candidate_ids, candidate_masks, mutation_positions = apply_delete(
                 state, source_idx, explore_size
             )
 
         ########################################
         # 4) Evaluate fitness
         ########################################
-        new_state = evaluate_fitness(model, cache_run, candidate_ids, batch_size=batch_size)
+        new_state = evaluate_fitness(model, cache_run, candidate_ids, candidate_masks, batch_size=batch_size)
         all_state = state.cat(new_state)
 
         # note that all_loss is a matrix with a row for each population
@@ -616,10 +539,10 @@ def token_grads(
         (input_ids.shape[0], input_ids.shape[1], embed.num_embeddings),
         dtype=torch.float,
     )
-    loss = torch.empty(input_ids.shape[0], device=model.device)
-    xentropy = torch.empty(input_ids.shape[0], device=model.device)
-    target = torch.empty(input_ids.shape[0], device=model.device)
-    final_token = torch.empty(input_ids.shape[0], device=model.device, dtype=torch.long)
+    loss = torch.empty(input_ids.shape[0], device=model.W_E.device)
+    xentropy = torch.empty(input_ids.shape[0], device=model.W_E.device)
+    target = torch.empty(input_ids.shape[0], device=model.W_E.device)
+    final_token = torch.empty(input_ids.shape[0], device=model.W_E.device, dtype=torch.long)
     extra = dict()
 
     with torch.enable_grad():
@@ -635,7 +558,7 @@ def token_grads(
             ).to(embed.weight.dtype)
             one_hot.requires_grad = True
 
-            cache = cache_run(inputs_embeds=torch.matmul(one_hot, embed.weight))
+            cache = cache_run(input_ids=torch.matmul(one_hot, embed.weight))
 
             logits_offset = cache["logits"][:, :-1]
             this_xentropy = (
@@ -750,6 +673,7 @@ def evaluate_fitness(
             if k not in ["target", "logits"]:
                 e = mini_batch[k]
                 if k not in extra:
+                    print(f"Creating extra tensor for {k}")
                     extra[k] = torch.empty(
                         (input_ids.shape[0], *e.shape[1:]),
                         dtype=e.dtype,
@@ -764,7 +688,7 @@ def evaluate_fitness(
         target=target,
         xentropy=xentropy,
         final_token=final_token,
-        token_grads=None,
+        token_grads=torch.full((input_ids.shape[0],), None, dtype=torch.object),
         extra=extra
     )
 
@@ -773,93 +697,174 @@ def evaluate_fitness(
 # Mutation operations
 ########################################
 
-def apply_gcg_swap(
+def compute_gradients(
     model: HookedSAETransformer,
     cache_run: Callable,
+    input_ids: torch.Tensor,
+    attention_mask: torch.Tensor,
+    x_penalty: torch.Tensor,
+    batch_size: int = 32,
+) -> State:
+    """
+    Compute gradients with respect to one-hot encoded input tokens.
+    
+    Args:
+        model: The model to compute gradients for
+        cache_run: Function that computes target values
+        input_ids: Input token IDs [batch_size, seq_len]
+        attention_mask: Attention mask (1 for tokens, 0 for padding)
+        x_penalty: Cross-entropy penalty for each sequence
+        batch_size: Batch size for processing
+        
+    Returns:
+        State object containing gradients and other information
+    """
+    embed = model.W_E
+    vocab_size = embed.shape[0]
+    device = embed.device
+    vocab_size = embed.shape[0]
+
+    # Initialize containers for results
+    batch_size_total = input_ids.shape[0]
+    seq_len = input_ids.shape[1]
+    token_grads = torch.zeros(
+        (batch_size_total, seq_len, vocab_size),
+        dtype=torch.float,
+        device=device
+    )
+    target = torch.zeros(batch_size_total, device=device)
+    xentropy = torch.zeros(batch_size_total, device=device)
+    final_token = torch.zeros(batch_size_total, device=device, dtype=torch.long)
+    extra = {}
+
+    with torch.enable_grad():
+        model.zero_grad()
+        
+        for i in range(0, batch_size_total, batch_size):
+            imax = min(i + batch_size, batch_size_total)
+            
+            result = cache_run(
+                input_ids=input_ids,
+                attention_mask=attention_mask[i:imax]
+            )
+            logits = result["logits"]
+            this_target = result["target"]
+            one_hot = result["one_hot"]
+
+            # Calculate cross-entropy (masked for variable-length sequences)
+            logits_offset = logits[:, :-1]
+            targets = input_ids[i:imax, 1:]
+            mask = attention_mask[i:imax, 1:]
+            
+            # Compute loss with masking for padding
+            loss_fn = torch.nn.CrossEntropyLoss(reduction='none')
+            token_losses = loss_fn(
+                logits_offset.reshape(-1, logits_offset.shape[-1]),
+                targets.reshape(-1)
+            ).reshape(logits_offset.shape[0], -1)
+            
+            # Apply mask and calculate mean over actual tokens
+            masked_loss = token_losses * mask
+            seq_lengths = mask.sum(dim=1).clamp(min=1)  # Avoid div by zero
+            this_xentropy = masked_loss.sum(dim=1) / seq_lengths
+            
+            # Get target values and compute loss with penalty
+            this_loss = -this_target + this_xentropy * x_penalty[i:imax]
+            
+            # Backpropagate combined loss
+            this_loss.sum().backward()
+            
+            # Store results
+            target[i:imax] = this_target
+            xentropy[i:imax] = this_xentropy
+            final_token[i:imax] = result["logits"][:, -1, :].argmax(dim=-1)
+            token_grads[i:imax] = one_hot.grad
+            
+            # Store any extra outputs
+            for k in result:
+                if k not in ["target", "logits", "one_hot"]:
+                    e = result[k]
+                    if k not in extra:
+                        extra[k] = torch.empty(
+                            (batch_size_total, *e.shape[1:]),
+                            dtype=e.dtype,
+                            device=e.device
+                        )
+                    extra[k][i:imax] = e
+            
+            # Clear gradients for next batch
+            model.zero_grad()
+        return State(
+            ids=input_ids,
+            attention_mask=attention_mask,
+            target=target,
+            xentropy=xentropy,
+            final_token=final_token,
+            token_grads=token_grads,
+            extra=extra
+        )
+
+
+def apply_gcg_swap(
     state: State,
     source_idx: torch.Tensor,
     topk: int,
-    explore_size: int,
-) -> Tuple[torch.Tensor, torch.Tensor]:
-    """Apply GCG-guided token swaps to create new candidate sequences."""
-    device = model.device
-    pad_token_id = model.tokenizer.pad_token_id
+    explore_size: int
+) -> Tuple[torch.Tensor, torch.Tensor, torch.Tensor]:
+    """
+    Apply GCG swap using pre-computed gradients from the state.
+    
+    Args:
+        state: State object containing pre-computed token gradients
+        source_idx: Indices of parent sequences to use for creating children
+        topk: Number of top tokens to consider for each position
+        explore_size: Total number of child candidates to generate
+        
+    Returns:
+        Tuple of (candidate token ids, attention masks, mutation positions)
+    """
+    device = state.ids.device
     
     # Create copies of parent sequences and masks for mutation
     candidate_ids = state.ids[source_idx].clone()
     candidate_masks = state.attention_mask[source_idx].clone()
     
-    # Get gradients through one-hot encoding
-    with torch.enable_grad():
-        model.zero_grad()
-        
-        # Convert to one-hot
-        one_hot = F.one_hot(
-            candidate_ids, 
-            num_classes=model.W_E.shape[0]
-        ).float()
-        one_hot.requires_grad = True
-        
-        # Compute embeddings manually
-        embeds = torch.matmul(one_hot, model.W_E)
-        
-        # Store for computation
-        activation_dict = {}
-        
-        # Hook to inject our embeddings
-        def embedding_hook(act, hook):
-            activation_dict['orig_embeds'] = act.clone()
-            return embeds
-        
-        # Run model with hook to inject embeddings
-        result = model.run_with_hooks(
-            input=candidate_ids,
-            attention_mask=candidate_masks,
-            fwd_hooks=[("hook_embed", embedding_hook)],
-            reset_hooks_end=True
-        )
-        
-        # Get target and backpropagate
-        # This depends on how cache_run works in your setup
-        # For now, use a placeholder approach
-        target = cache_run(input_ids=candidate_ids, attention_mask=candidate_masks)['target']
-        (-target).sum().backward()
-        
-        # Get topk alternative tokens per position based on gradients
-        topk_grad = (-one_hot.grad).topk(k=topk, dim=-1)
-        
-        # Select random positions to mutate (only where attention mask is 1)
-        # Make sure these are valid positions (not padding)
-        seq_lens = candidate_masks.sum(dim=1).to(torch.long)
-        pos = torch.zeros(explore_size, dtype=torch.long, device=device)
-        
-        for i in range(explore_size):
-            # Choose a random position (not padding)
-            valid_len = seq_lens[i].item()
-            if valid_len > 0:
-                pos[i] = torch.randint(0, valid_len, (1,), device=device)
-        
-        # Select random tokens from topk candidates
-        token_idx = torch.randint(
-            low=0,
-            high=topk,
-            size=(explore_size,),
-            device=device
-        )
-        
-        # Apply mutations
-        for i in range(explore_size):
-            candidate_ids[i, pos[i]] = topk_grad.indices[i, pos[i], token_idx[i]]
+    # Get sequence lengths (excluding padding)
+    seq_lens = candidate_masks.sum(dim=1).to(torch.long)
+    
+    # For tracking which positions were modified
+    mutation_positions = torch.zeros(explore_size, dtype=torch.long, device=device)
+    
+    # Use the pre-computed gradients from the state
+    # Select top-k tokens per position based on negative gradients
+    # (negative because we want to decrease loss)
+    topk_grad = (-state.token_grads).topk(k=topk, dim=-1)
+    
+    # Select random positions and random tokens from top-k
+    for i in range(explore_size):
+        # Only select positions with real tokens (not padding)
+        valid_len = seq_lens[i].item()
+        if valid_len > 0:
+            # Choose random position within sequence length
+            pos = torch.randint(0, valid_len, (1,), device=device).item()
+            mutation_positions[i] = pos
+            
+            # Choose random token from top-k for this position
+            token_idx = torch.randint(0, topk, (1,), device=device).item()
+            
+            # Apply the mutation
+            parent_idx = source_idx[i]
+            candidate_ids[i, pos] = topk_grad.indices[parent_idx, pos, token_idx]
+    
+    return candidate_ids, candidate_masks, mutation_positions
 
-    return candidate_ids, candidate_masks
 
 def apply_sample_insert(
     model: HookedSAETransformer,
-    cache_run: Callable,
     state: State,
     source_idx: torch.Tensor,
-    sample_k2: int,
     explore_size: int,
+    sample_k2: int=32,
     max_tokens: int = 16,
 ) -> Tuple[torch.Tensor, torch.Tensor]:
     """Apply token insertion based on model probability to create new candidate sequences.
@@ -876,7 +881,7 @@ def apply_sample_insert(
     Returns:
         Tuple of (candidate token ids, attention masks)
     """
-    device = model.device
+    device = model.W_E.device
     pad_token_id = model.tokenizer.pad_token_id if model.tokenizer.pad_token_id is not None else model.tokenizer.eos_token_id
     
     # Get original sequences and their lengths
@@ -970,7 +975,7 @@ def apply_sample_swap(
     Returns:
         Tuple of (candidate token ids, attention masks, mutation positions)
     """
-    device = model.device
+    device = model.W_E.device
     
     # Get original sequences and their masks
     original_ids = state.ids[source_idx]
@@ -1149,7 +1154,7 @@ def pareto_callback(model, x_penalty_min, x_penalty_max):
             torch.linspace(
                 np.log(x_penalty_min / 10.0), np.log(x_penalty_max * 10.0), 200
             )
-        ).to(model.device)
+        ).to(model.W_E.device)
         loss = -state.target[None] + Xvs[:, None] * state.xentropy[None]
         idxs = loss.argmin(dim=1)
         for i in range(len(Xvs)):

@@ -1,18 +1,10 @@
-"""
-_summary_
-
-#dummy
-
-Returns
--------
-    _description_
-"""
 from typing import Optional, Tuple
 
 import torch
 from transformers.models.gpt_neox.modeling_gpt_neox import apply_rotary_pos_emb
 
-def sae_feature_runner(model, sae, feature_idx, use_post=False):
+# remove me (eventually)
+def sae_feature_runner_single(model, sae, feature_idx, use_post=False):
     """
     Create a runner function for optimizing prompts to maximize SAE feature activation.
     
@@ -23,55 +15,145 @@ def sae_feature_runner(model, sae, feature_idx, use_post=False):
         use_post: If True, use post-activation values, otherwise use pre-activation
     
     Returns:
-        callable: A function compatible with EPO that returns a dict with 'target' and 'logits'
+        A function that computes gradients for token substitution
     """
-    def run(input_ids=None, attention_mask=None, inputs_embeds=None):
-        # Run model with the SAE and capture cache
-        outputs, cache = model.run_with_cache_with_saes(
-            input_ids=input_ids,
-            attention_mask=attention_mask,
-            inputs_embeds=inputs_embeds,
-            saes=[sae]
+    def run(input_ids=None, inputs_embeds=None):
+        # Storage for activations
+        layer_activations = None
+        
+        # Create one-hot encoding with gradients
+        one_hot = torch.nn.functional.one_hot(input_ids, num_classes=model.W_E.shape[0]).float()
+        one_hot = one_hot.to(model.W_E.dtype).to(model.W_E.device)
+        one_hot.requires_grad_(True)
+        
+        # Create embeddings
+        embeds = torch.matmul(one_hot, model.W_E)
+        
+        # Get the layer from the SAE hook name (e.g., "blocks.0.attn.hook_z" -> "blocks.0.attn")
+        layer_name = sae.cfg.hook_name
+        
+        # Hook to capture the layer activations
+        def get_layer_activation(act, hook):
+            nonlocal layer_activations
+            layer_activations = act
+            return act
+        
+        # Run model with hooks
+        logits = model.run_with_hooks(
+            start_at_layer=0,
+            input=embeds,
+            fwd_hooks=[
+                (layer_name, get_layer_activation)
+            ]
         )
-        
-        # Get SAE activations - either pre or post activations
-        sae_acts_key = f"{sae.cfg.hook_name}.hook_sae_acts_{'post' if use_post else 'pre'}"
-        
-        if sae_acts_key not in cache:
-            # Try the alternative if the requested one isn't found
-            alt_key = f"{sae.cfg.hook_name}.hook_sae_acts_{'pre' if use_post else 'post'}"
-            if alt_key in cache:
-                sae_acts_key = alt_key
-                print(f"Warning: Requested key {sae_acts_key} not found, using {alt_key} instead")
-            else:
-                raise KeyError(f"Could not find SAE activations in cache. Available keys: {list(cache.keys())}")
-        
-        sae_acts = cache[sae_acts_key]
-        
-        # Get activations at the last non-padding token for each sequence
-        if attention_mask is not None:
-            # Calculate sequence lengths from attention mask
-            seq_lengths = attention_mask.sum(dim=1).to(torch.long)
-            batch_size = input_ids.shape[0] if input_ids is not None else inputs_embeds.shape[0]
-            
-            # Initialize target values
-            target = torch.zeros(batch_size, device=model.device)
-            
-            # Extract feature activation at the last token of each sequence
-            for i in range(batch_size):
-                if seq_lengths[i] > 0:
-                    pos = seq_lengths[i] - 1  # 0-indexed
-                    target[i] = sae_acts[i, pos, feature_idx]
-        else:
-            # If no attention mask, use the last position
-            target = sae_acts[:, -1, feature_idx]
+        last_token_activation = layer_activations[0, -1]
+
+        target = last_token_activation.to(sae.dtype) @ sae.W_dec[feature_idx]
         
         return {
             "target": target,
-            "logits": outputs.logits
+            "logits": logits,
+            "one_hot": one_hot
+        }
+    return run
+
+def sae_feature_runner(model, sae, feature_idx, use_post=False):
+    """
+    Create a runner function for optimizing prompts to maximize SAE feature activation.
+   
+    Args:
+        model: The HookedSAETransformer model
+        sae: The sparse autoencoder
+        feature_idx: Index of the feature to target
+        use_post: If True, use post-activation values, otherwise use pre-activation
+   
+    Returns:
+        A function that computes gradients for token substitution with batch support
+    """
+    def run(input_ids=None, inputs_embeds=None, attention_mask=None):
+        # Storage for activations
+        layer_activations = None
+        
+        # Get batch size
+        if input_ids is not None:
+            batch_size = input_ids.shape[0]
+            seq_length = input_ids.shape[1]
+            device = input_ids.device
+        else:
+            batch_size = inputs_embeds.shape[0]
+            seq_length = inputs_embeds.shape[1]
+            device = inputs_embeds.device
+            
+        # Create default attention mask if none provided
+        if attention_mask is None:
+            attention_mask = torch.ones((batch_size, seq_length), dtype=torch.long, device=device)
+        
+        # For input_ids path: create one-hot encoding with gradients
+        if input_ids is not None:
+            one_hot = torch.nn.functional.one_hot(input_ids, num_classes=model.W_E.shape[0]).float()
+            one_hot = one_hot.to(model.W_E.dtype).to(model.W_E.device)
+            one_hot.requires_grad_(True)
+            
+            # Create embeddings
+            embeds = torch.matmul(one_hot, model.W_E)
+            
+            # Add positional embeddings if available
+            if hasattr(model, 'W_pos') and model.W_pos is not None:
+                position_ids = torch.arange(seq_length, device=device).unsqueeze(0).expand(batch_size, -1)
+                pos_embeds = model.W_pos[position_ids]
+                embeds = embeds + pos_embeds
+                
+            # Apply layer normalization if available
+            if hasattr(model, 'ln_embed') and model.ln_embed is not None:
+                embeds = model.ln_embed(embeds)
+        else:
+            # For inputs_embeds path: use the provided embeddings
+            embeds = inputs_embeds
+            one_hot = None
+       
+        # Get the layer from the SAE hook name
+        layer_name = sae.cfg.hook_name
+       
+        # Hook to capture the layer activations
+        def get_layer_activation(act, hook):
+            nonlocal layer_activations
+            layer_activations = act
+            return act
+       
+        # Run model with hooks
+        logits = model.run_with_hooks(
+            start_at_layer=0,
+            input=embeds,
+            attention_mask=attention_mask,
+            fwd_hooks=[(layer_name, get_layer_activation)]
+        )
+        
+        # Calculate sequence lengths from attention mask
+        seq_lengths = attention_mask.sum(dim=1).to(torch.long)
+        
+        # Get the last valid token position for each sequence
+        batch_indices = torch.arange(batch_size, device=device)
+        last_positions = torch.clamp(seq_lengths - 1, min=0)  # Avoid negative indices
+        
+        # Extract activations at the last real token for each sequence
+        # Shape: [batch_size, hidden_dim]
+        last_token_activations = layer_activations[batch_indices, last_positions]
+        
+        # Apply the SAE decoder weights for the selected feature
+        # Reshape sae.W_dec[feature_idx] to match the batch of activations
+        targets = last_token_activations.to(sae.dtype) @ sae.W_dec[feature_idx]
+        
+        # Make sure all zero activations for empty sequences (shouldn't happen, but just in case)
+        targets = targets * (seq_lengths > 0).float()
+       
+        return {
+            "target": targets,
+            "logits": logits,
+            "one_hot": one_hot
         }
     
     return run
+
 
 def does_retokenize(model, tokenizer, input_ids):
     good = torch.empty(input_ids.shape[0], dtype=bool).to(model.device)
