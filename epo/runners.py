@@ -151,7 +151,6 @@ def sae_feature_runner(model, sae, feature_idx, use_post=False):
             "logits": logits,
             "one_hot": one_hot
         }
-    
     return run
 
 
