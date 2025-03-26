@@ -195,7 +195,7 @@ def epo(
             seq_len = tokens.shape[1]
             input_ids[i, :seq_len] = tokens[0, :seq_len]
     else:
-        torch.manual_seed(int(time.time()) % 100)
+        #torch.manual_seed(int(time.time()) % 100)
         # Generate random token IDs
         history = History()
         init_length = int((min_tokens + max_tokens) / 2)  # Use average of min and max for length
@@ -828,7 +828,7 @@ def apply_gcg_swap(
         valid_len = seq_lens[i].item()
         if valid_len > 0:
             # Choose random position within sequence length
-            pos = torch.randint(0, valid_len, (1,), device=device).item()
+            pos = torch.randint(1, valid_len, (1,), device=device).item()
             mutation_positions[i] = pos
             
 
