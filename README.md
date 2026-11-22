@@ -29,6 +29,8 @@ optimizer.state.prompts, optimizer.state.activations   # final population and ac
 
 `quickstart.ipynb` runs one latent end to end. `latents.json` contains the 486 Gemma 2 latents evaluated in the paper, with their Neuronpedia top activations (for computing activation ratios) and the balanced and hardness-weighted subsets used for the ablations.
 
+`annotation_task.html` is the blank form used for the human evaluation: 60 latents, each with an explanation, Neuronpedia's top-activating examples and three prompts (ADAPT, GCG, GCG with a fluency penalty) in random order, rated 1-5. Open it in a browser; ratings export as JSON.
+
 ## Citation
 
 ```bibtex
